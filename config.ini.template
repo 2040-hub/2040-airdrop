@@ -1,0 +1,10 @@
+[settings]
+nft_worker_url = YOUR_NFT_WORKER_URL
+nft_collection_id = YOUR_COLLECTION_ID
+dry_run = true
+private_key = YOUR_BASE58_PRIVATE_KEY_HERE
+rpc_url = YOUR_RPC_URL
+total_usdc_amount = 10
+min_usdc_amount = 0.1
+tx_sleep_time = 1
+tx_max_retries = 5
