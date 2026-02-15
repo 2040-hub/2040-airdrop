@@ -6,6 +6,7 @@ Random USDC Airdrop to NFT Holders on Solana
 - Supports dry_run mode for testing
 """
 
+import argparse
 import configparser
 import json
 import random
@@ -58,6 +59,7 @@ def load_config(path: str = "config.ini") -> dict:
         "min_usdc_amount": float(s.get("min_usdc_amount")),
         "tx_sleep_time": float(s.get("tx_sleep_time", "1")),
         "tx_max_retries": int(s.get("tx_max_retries", "5")),
+        "address_mapping_file": s.get("address_mapping_file", ""),
     }
 
 
@@ -72,6 +74,128 @@ def fetch_holders(worker_url: str, collection_id: str) -> List[str]:
     holders = data.get("holders", [])
     logger.info(f"Got {len(holders)} unique holders")
     return holders
+
+
+def load_address_mapping(file_path):
+    # type: (str) -> dict
+    """
+    Load address mapping from a JSON file.
+
+    Expected JSON format:
+    {
+        "original_address_1": "mapped_address_1",
+        "original_address_2": "mapped_address_2"
+    }
+
+    Returns a dict of {original_address: mapped_address}.
+    Validates that all addresses are valid Solana public keys.
+    """
+    if not file_path or not file_path.strip():
+        return {}
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            mapping = json.load(f)
+    except FileNotFoundError:
+        logger.error("Address mapping file not found: %s", file_path)
+        raise
+    except json.JSONDecodeError as e:
+        logger.error("Invalid JSON in address mapping file %s: %s", file_path, e)
+        raise
+
+    if not isinstance(mapping, dict):
+        raise ValueError(
+            "Address mapping file must contain a JSON object (dict), got %s"
+            % type(mapping).__name__
+        )
+
+    validated = {}
+    for orig, dest in mapping.items():
+        orig_str = str(orig).strip()
+        dest_str = str(dest).strip()
+
+        if not orig_str or not dest_str:
+            raise ValueError("Address mapping contains empty address: '%s' -> '%s'" % (orig, dest))
+
+        if orig_str == dest_str:
+            logger.warning("Address mapping has identical source and destination, skipping: %s", orig_str)
+            continue
+
+        # Validate both addresses are valid Solana public keys
+        try:
+            Pubkey.from_string(orig_str)
+        except Exception:
+            raise ValueError("Invalid source address in mapping: %s" % orig_str)
+
+        try:
+            Pubkey.from_string(dest_str)
+        except Exception:
+            raise ValueError("Invalid destination address in mapping: %s" % dest_str)
+
+        validated[orig_str] = dest_str
+
+    logger.info("Loaded %d address mapping(s) from %s", len(validated), file_path)
+    for orig, dest in validated.items():
+        logger.info("  Mapping: %s -> %s", orig, dest)
+
+    return validated
+
+
+def apply_address_mapping(holders, address_mapping):
+    # type: (List[str], dict) -> List[Tuple[str, str]]
+    """
+    Apply address mapping to holders list.
+
+    Returns a list of (original_holder_address, actual_recipient_address) tuples.
+    If a holder has a mapping, the actual_recipient is the mapped address;
+    otherwise the actual_recipient is the holder's own address.
+
+    Also checks that mapped destinations don't collide with existing holders
+    or other mappings, logging warnings if so.
+    """
+    if not address_mapping:
+        return [(h, h) for h in holders]
+
+    # Track how many holders map to the same destination for dedup warnings
+    dest_sources = {}  # type: dict
+    result = []
+    mapped_count = 0
+
+    for holder in holders:
+        if holder in address_mapping:
+            actual_recipient = address_mapping[holder]
+            mapped_count += 1
+            logger.info(
+                "  Holder %s mapped to %s",
+                holder,
+                actual_recipient,
+            )
+        else:
+            actual_recipient = holder
+
+        # Track duplicate destinations
+        if actual_recipient not in dest_sources:
+            dest_sources[actual_recipient] = []
+        dest_sources[actual_recipient].append(holder)
+
+        result.append((holder, actual_recipient))
+
+    # Warn about duplicate destinations (multiple holders mapping to same address)
+    for dest, sources in dest_sources.items():
+        if len(sources) > 1:
+            logger.warning(
+                "Multiple holders map to the same recipient %s: %s",
+                dest,
+                sources,
+            )
+
+    logger.info(
+        "Address mapping applied: %d of %d holders remapped",
+        mapped_count,
+        len(holders),
+    )
+
+    return result
 
 
 def generate_random_amounts(total: float, n: int, min_amount: float) -> List[float]:
@@ -217,6 +341,155 @@ def send_usdc(
     raise last_error
 
 
+def parse_args():
+    # type: () -> argparse.Namespace
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="NFT Holder USDC Random Airdrop on Solana",
+    )
+    parser.add_argument(
+        "--test",
+        nargs=2,
+        metavar=("MODE", "AMOUNT"),
+        help=(
+            "Test mode. Currently supports: --test mapping <usdc_amount>. "
+            "Sends <usdc_amount> USDC to each mapped address (ignores dry_run)."
+        ),
+    )
+    return parser.parse_args()
+
+
+def run_test_mapping(test_amount_str):
+    # type: (str) -> None
+    """
+    Test mode: send a fixed USDC amount to each address that has a mapping.
+
+    Workflow:
+    1. Load config and address mapping
+    2. Fetch NFT holders
+    3. Find holders that exist in address_mapping
+    4. Send test_amount USDC to each mapped destination
+    5. Ignores dry_run setting
+    """
+    # Validate amount
+    try:
+        test_amount = float(test_amount_str)
+    except ValueError:
+        logger.error("Invalid test amount: %s (must be a number)", test_amount_str)
+        sys.exit(1)
+
+    if test_amount <= 0:
+        logger.error("Test amount must be positive, got: %s", test_amount)
+        sys.exit(1)
+
+    if test_amount > 1000000:
+        logger.error("Test amount seems unreasonably large: %s USDC", test_amount)
+        sys.exit(1)
+
+    config = load_config()
+
+    logger.info("=" * 60)
+    logger.info("TEST MODE: Address Mapping Verification")
+    logger.info("=" * 60)
+    logger.info(f"Test amount   : {test_amount} USDC per mapped holder")
+    logger.info(f"Collection ID : {config['nft_collection_id']}")
+    logger.info(f"Addr mapping  : {config['address_mapping_file'] or '(none)'}")
+    logger.info(f"dry_run is IGNORED in test mode")
+
+    # Load address mapping (required for this test)
+    if not config["address_mapping_file"]:
+        logger.error("address_mapping_file is not configured. Cannot run --test mapping.")
+        sys.exit(1)
+
+    try:
+        address_mapping = load_address_mapping(config["address_mapping_file"])
+    except (ValueError, FileNotFoundError, json.JSONDecodeError) as e:
+        logger.error("Failed to load address mapping: %s", e)
+        sys.exit(1)
+
+    if not address_mapping:
+        logger.error("Address mapping is empty. Nothing to test.")
+        sys.exit(1)
+
+    # Fetch holders
+    holders = fetch_holders(config["nft_worker_url"], config["nft_collection_id"])
+    if not holders:
+        logger.error("No holders found. Exiting.")
+        sys.exit(1)
+
+    # Find holders that have a mapping
+    holders_set = set(holders)
+    mapped_pairs = []  # type: List[Tuple[str, str]]
+    unmapped_keys = []  # type: List[str]
+
+    for orig, dest in address_mapping.items():
+        if orig in holders_set:
+            mapped_pairs.append((orig, dest))
+        else:
+            unmapped_keys.append(orig)
+
+    if unmapped_keys:
+        logger.warning(
+            "The following mapped addresses are NOT current NFT holders (skipped): %s",
+            unmapped_keys,
+        )
+
+    if not mapped_pairs:
+        logger.error(
+            "No address mapping entries match current NFT holders. Nothing to send."
+        )
+        sys.exit(1)
+
+    total_test_usdc = round(test_amount * len(mapped_pairs), USDC_DECIMALS)
+    logger.info(f"\nTest plan: {len(mapped_pairs)} mapped holder(s), "
+                f"{test_amount} USDC each, total = {total_test_usdc} USDC")
+
+    for i, (orig, dest) in enumerate(mapped_pairs):
+        logger.info(f"  [{i+1:>3}/{len(mapped_pairs)}] {orig} -> {dest} : {test_amount:.6f} USDC")
+
+    # Initialize Solana client and keypair
+    client = Client(config["rpc_url"])
+    try:
+        secret_key = base58.b58decode(config["private_key"])
+        payer = Keypair.from_bytes(secret_key)
+    except Exception as e:
+        logger.error(f"Failed to load private key: {e}")
+        sys.exit(1)
+
+    logger.info(f"\nSender address: {payer.pubkey()}")
+
+    # Execute test transfers
+    sent_total = 0.0
+    success_count = 0
+    fail_count = 0
+
+    for i, (orig, dest) in enumerate(mapped_pairs):
+        recipient = Pubkey.from_string(dest)
+        logger.info(
+            f"[{i+1:>3}/{len(mapped_pairs)}] Sending {test_amount:.6f} USDC "
+            f"to {dest} (on behalf of holder {orig}) ..."
+        )
+
+        try:
+            sig = send_usdc(client, payer, recipient, test_amount, max_retries=config["tx_max_retries"])
+            sent_total = round(sent_total + test_amount, USDC_DECIMALS)
+            success_count += 1
+            logger.info(f"  ✅ TX: {sig}  (cumulative: {sent_total:.6f} USDC)")
+        except Exception as e:
+            fail_count += 1
+            logger.error(f"  ❌ Failed: {e}")
+
+        if i < len(mapped_pairs) - 1:
+            time.sleep(config["tx_sleep_time"])
+
+    logger.info("\n" + "=" * 60)
+    logger.info("Test mapping airdrop complete!")
+    logger.info(f"  Success: {success_count}")
+    logger.info(f"  Failed : {fail_count}")
+    logger.info(f"  Total sent: {sent_total:.6f} / {total_test_usdc} USDC")
+    logger.info("=" * 60)
+
+
 def main():
     config = load_config()
 
@@ -229,12 +502,22 @@ def main():
     logger.info(f"Dry run       : {config['dry_run']}")
     logger.info(f"Sleep time    : {config['tx_sleep_time']}s")
     logger.info(f"Max retries   : {config['tx_max_retries']}")
+    logger.info(f"Addr mapping  : {config['address_mapping_file'] or '(none)'}")
 
     # 1. Fetch holders
     holders = fetch_holders(config["nft_worker_url"], config["nft_collection_id"])
     if not holders:
         logger.error("No holders found. Exiting.")
         sys.exit(1)
+
+    # 1.5. Load and apply address mapping
+    try:
+        address_mapping = load_address_mapping(config["address_mapping_file"])
+    except (ValueError, FileNotFoundError, json.JSONDecodeError) as e:
+        logger.error("Failed to load address mapping: %s", e)
+        sys.exit(1)
+
+    holder_recipient_pairs = apply_address_mapping(holders, address_mapping)
 
     # 2. Generate random amounts
     try:
@@ -258,11 +541,16 @@ def main():
     logger.info(f"  Max amount: {max(amounts):.6f} USDC")
     logger.info(f"  Avg amount: {actual_total / len(amounts):.6f} USDC")
 
-    # Pair holders with amounts
-    plan: List[Tuple[str, float]] = list(zip(holders, amounts))
+    # Pair holders with amounts: (original_holder, actual_recipient, amount)
+    plan = []  # type: List[Tuple[str, str, float]]
+    for (orig, recipient), amt in zip(holder_recipient_pairs, amounts):
+        plan.append((orig, recipient, amt))
 
-    for i, (addr, amt) in enumerate(plan):
-        logger.info(f"  [{i+1:>3}/{len(plan)}] {addr} -> {amt:.6f} USDC")
+    for i, (orig, recipient, amt) in enumerate(plan):
+        if orig != recipient:
+            logger.info(f"  [{i+1:>3}/{len(plan)}] {orig} (mapped -> {recipient}) -> {amt:.6f} USDC")
+        else:
+            logger.info(f"  [{i+1:>3}/{len(plan)}] {orig} -> {amt:.6f} USDC")
 
     if config["dry_run"]:
         logger.info("\n[DRY RUN] No transactions will be sent.")
@@ -285,18 +573,24 @@ def main():
     success_count = 0
     fail_count = 0
 
-    for i, (addr, amt) in enumerate(plan):
+    for i, (orig, recipient_addr, amt) in enumerate(plan):
         # Double-check: do not exceed total
         if round(sent_total + amt, USDC_DECIMALS) > config["total_usdc_amount"]:
             logger.warning(
-                f"Skipping {addr}: would exceed total "
+                f"Skipping {orig}: would exceed total "
                 f"({sent_total + amt:.6f} > {config['total_usdc_amount']})"
             )
             fail_count += 1
             continue
 
-        recipient = Pubkey.from_string(addr)
-        logger.info(f"[{i+1:>3}/{len(plan)}] Sending {amt:.6f} USDC to {addr} ...")
+        recipient = Pubkey.from_string(recipient_addr)
+        if orig != recipient_addr:
+            logger.info(
+                f"[{i+1:>3}/{len(plan)}] Sending {amt:.6f} USDC to {recipient_addr} "
+                f"(on behalf of holder {orig}) ..."
+            )
+        else:
+            logger.info(f"[{i+1:>3}/{len(plan)}] Sending {amt:.6f} USDC to {recipient_addr} ...")
 
         try:
             sig = send_usdc(client, payer, recipient, amt, max_retries=config["tx_max_retries"])
@@ -319,4 +613,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    if args.test:
+        test_mode, test_amount_str = args.test
+        if test_mode.lower() != "mapping":
+            logger.error("Unknown test mode: '%s'. Supported: mapping", test_mode)
+            sys.exit(1)
+        run_test_mapping(test_amount_str)
+    else:
+        main()
