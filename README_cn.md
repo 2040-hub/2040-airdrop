@@ -1,12 +1,12 @@
-# NFT Holder USDC Random Airdrop
+# NFT Holder USDC 随机空投
 
-向 Solana NFT 持有者随机空投 USDC，类似微信随机红包的分配方式。
+向 Solana NFT 持有者随机空投 USDC，使用可配置的 Dirichlet 分布算法。
 
 ## 工作流程
 
 1. 通过 Cloudflare Worker API 获取指定 NFT Collection 的所有持有者地址
 2. 可选：通过地址映射将空投重定向到持有者指定的其他钱包
-3. 使用「切割线段」算法将总 USDC 金额随机分配给每个持有者（每人至少获得 `min_usdc_amount`）
+3. 使用可配置的 Dirichlet 分布将总 USDC 金额随机分配给每个持有者（每人至少获得 `min_usdc_amount`）
 4. 逐笔发送 USDC 转账交易（自动为没有 USDC ATA 的地址创建关联代币账户）
 
 ## 环境要求
@@ -37,6 +37,7 @@ min_usdc_amount = 0.1
 tx_sleep_time = 1
 tx_max_retries = 5
 address_mapping_file = address_mapping.json
+distribution_alpha = 0.1
 ```
 
 ### 配置项说明
@@ -53,6 +54,23 @@ address_mapping_file = address_mapping.json
 | `tx_sleep_time` | 每笔转账之间的等待秒数 | `1` |
 | `tx_max_retries` | 单笔转账失败后的最大重试次数 | `5` |
 | `address_mapping_file` | 地址映射 JSON 文件路径，将持有者地址映射到其他接收地址（可选，留空则不启用） | `address_mapping.json` |
+| `distribution_alpha` | Dirichlet 分布的 alpha 参数，控制随机分配的方差大小（默认：`1.0`）。`1.0` = 经典切割线段算法（适度随机）。`< 1.0` = 方差更大（少数人拿大额，多数人拿小额）。`> 1.0` = 方差更小（金额趋于均分）。推荐值：`0.1`–`0.5` 可产生刺激的分配效果，偶尔出现大额赢家。 | `0.3` |
+
+## 分配算法
+
+脚本使用 **Dirichlet 分布** 将 USDC 资金池随机分配给持有者。`distribution_alpha` 参数控制随机性的「激烈程度」：
+
+| `distribution_alpha` | 行为 | 最大金额概率（102 持有者, 8099.7 USDC, 保底 20） |
+|---|---|---|
+| `1.0`（默认） | 经典「切割线段」— 适度随机，类似微信随机红包 | 最大值 > 1000: ~0%, 最大值 > 500: ~2.5% |
+| `0.5` | 中等高方差 — 部分幸运持有者明显获得更多 | 最大值 > 1000: ~0.3%, 最大值 > 500: ~36% |
+| `0.3` | 高方差 — 偶尔出现大额赢家 | 最大值 > 1000: ~5%, 最大值 > 2000: ~0.01% |
+| `0.2` | 很高方差 — 刺激的分配效果，赢家明显 | 最大值 > 1000: ~20%, 最大值 > 2000: ~0.1% |
+| `0.1` | 极端方差 — 少数人赢大额，多数人接近保底 | 最大值 > 1000: ~69%, 最大值 > 2000: ~6% |
+
+**工作原理：** 每个持有者首先获得保底金额（`min_usdc_amount`）。剩余资金池使用 Dirichlet(alpha) 分布进行分割 — 这是一种定义在单纯形上的概率分布。当 alpha < 1 时，分布将概率质量集中在少数持有者上，产生「大赢家」。当 alpha = 1 时，等价于均匀的切割线段算法。当 alpha > 1 时，金额趋向于均分。
+
+无论 alpha 取何值，分发总额永远不会超过 `total_usdc_amount`。
 
 ## 地址映射
 
@@ -93,15 +111,16 @@ python nft_airdrop.py
 2026-02-06 12:00:00 [INFO] NFT Holder USDC Random Airdrop
 2026-02-06 12:00:00 [INFO] ============================================================
 2026-02-06 12:00:00 [INFO] Collection ID : 6mS3jtvn...
-2026-02-06 12:00:00 [INFO] Total USDC    : 10.0
-2026-02-06 12:00:00 [INFO] Min per holder: 0.1
+2026-02-06 12:00:00 [INFO] Total USDC    : 100.0
+2026-02-06 12:00:00 [INFO] Min per holder: 0.5
 2026-02-06 12:00:00 [INFO] Dry run       : True
 2026-02-06 12:00:00 [INFO] Addr mapping  : address_mapping.json
+2026-02-06 12:00:00 [INFO] Distr. alpha  : 0.3 (Dirichlet, high variance)
 2026-02-06 12:00:00 [INFO] Fetching holders for collection: 6mS3jtvn...
-2026-02-06 12:00:01 [INFO] Got 23 unique holders
-2026-02-06 12:00:01 [INFO] Distribution plan (23 holders, total=10.0 USDC):
-2026-02-06 12:00:01 [INFO]   [  1/23] 7xKXtg...AsU -> 0.318472 USDC
-2026-02-06 12:00:01 [INFO]   [  2/23] 3yFwqX...y1E (mapped -> 9aBcDe...f2G) -> 0.142856 USDC
+2026-02-06 12:00:01 [INFO] Got 10 unique holders
+2026-02-06 12:00:01 [INFO] Distribution plan (10 holders, total=100.0 USDC):
+2026-02-06 12:00:01 [INFO]   [  1/10] 7xKXtg...AsU -> 3.182345 USDC
+2026-02-06 12:00:01 [INFO]   [  2/10] 3yFwqX...y1E -> 45.432100 USDC
 ...
 2026-02-06 12:00:01 [INFO] [DRY RUN] No transactions will be sent.
 ```
@@ -145,5 +164,4 @@ python nft_airdrop.py
 
 - **请勿将私钥提交到 Git 仓库**，建议将 `config.ini` 加入 `.gitignore`
 - 发送方钱包需要有足够的 USDC 余额和少量 SOL 用于支付交易费及 ATA 创建的 rent
-- 当 `min_usdc_amount × 持有者数量 > total_usdc_amount` 时脚本会报错退出，请调整配置
 - 使用地址映射时，建议先运行 `--test mapping <小额金额>` 验证映射地址能否正常接收 USDC

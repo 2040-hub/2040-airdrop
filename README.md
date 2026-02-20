@@ -1,12 +1,12 @@
 # NFT Holder USDC Random Airdrop
 
-Randomly airdrop USDC to Solana NFT holders, using a distribution algorithm inspired by WeChat's random red envelopes.
+Randomly airdrop USDC to Solana NFT holders, using a configurable Dirichlet distribution algorithm.
 
 ## How It Works
 
 1. Fetches all holder addresses for a given NFT collection via a Cloudflare Worker API
 2. Optionally applies an address mapping to redirect airdrops to alternate wallets
-3. Splits the total USDC amount randomly across holders using a "cut the line" algorithm (each holder is guaranteed at least `min_usdc_amount`)
+3. Splits the total USDC amount randomly across holders using a configurable Dirichlet distribution (each holder is guaranteed at least `min_usdc_amount`)
 4. Sends USDC transfers one by one, automatically creating Associated Token Accounts (ATAs) for recipients who don't have one yet
 
 ## Requirements
@@ -37,6 +37,7 @@ min_usdc_amount = 0.1
 tx_sleep_time = 1
 tx_max_retries = 5
 address_mapping_file = address_mapping.json
+distribution_alpha = 0.1
 ```
 
 ### Configuration Reference
@@ -53,6 +54,23 @@ address_mapping_file = address_mapping.json
 | `tx_sleep_time` | Delay in seconds between each transfer | `1` |
 | `tx_max_retries` | Maximum retry attempts per failed transaction | `5` |
 | `address_mapping_file` | Path to a JSON file that maps holder addresses to alternate recipient addresses (optional, leave empty to disable) | `address_mapping.json` |
+| `distribution_alpha` | Dirichlet distribution alpha parameter controlling amount variance (default: `1.0`). `1.0` = classic cut-the-line algorithm (moderate randomness). `< 1.0` = higher variance (some holders get much more, most get less). `> 1.0` = lower variance (amounts cluster toward the mean). Recommended: `0.1`–`0.5` for exciting distributions with occasional big winners. | `0.3` |
+
+## Distribution Algorithm
+
+The script uses a **Dirichlet distribution** to randomly split the USDC pool among holders. The `distribution_alpha` parameter controls how "wild" the randomness is:
+
+| `distribution_alpha` | Behavior | Max amount probability (102 holders, 8099.7 USDC, min 20) |
+|---|---|---|
+| `1.0` (default) | Classic "cut the line" — moderate randomness, similar to WeChat red envelopes | Max > 1000: ~0%, Max > 500: ~2.5% |
+| `0.5` | Moderate high variance — some lucky holders get noticeably more | Max > 1000: ~0.3%, Max > 500: ~36% |
+| `0.3` | High variance — occasional big winners emerge | Max > 1000: ~5%, Max > 2000: ~0.01% |
+| `0.2` | Very high variance — exciting distribution with clear winners | Max > 1000: ~20%, Max > 2000: ~0.1% |
+| `0.1` | Extreme variance — a few holders win big, most get near minimum | Max > 1000: ~69%, Max > 2000: ~6% |
+
+**How it works:** Each holder is first guaranteed their minimum (`min_usdc_amount`). The remaining pool is then split using Dirichlet(alpha) — a probability distribution over the simplex. When alpha < 1, the distribution concentrates mass on a few holders, creating "big winners". When alpha = 1, it's equivalent to the uniform cut-the-line algorithm. When alpha > 1, amounts converge toward equal splits.
+
+The total distributed never exceeds `total_usdc_amount` regardless of the alpha value.
 
 ## Address Mapping
 
@@ -93,15 +111,16 @@ Sample output:
 2026-02-06 12:00:00 [INFO] NFT Holder USDC Random Airdrop
 2026-02-06 12:00:00 [INFO] ============================================================
 2026-02-06 12:00:00 [INFO] Collection ID : 6mS3jtvn...
-2026-02-06 12:00:00 [INFO] Total USDC    : 10.0
-2026-02-06 12:00:00 [INFO] Min per holder: 0.1
+2026-02-06 12:00:00 [INFO] Total USDC    : 100.0
+2026-02-06 12:00:00 [INFO] Min per holder: 0.5
 2026-02-06 12:00:00 [INFO] Dry run       : True
 2026-02-06 12:00:00 [INFO] Addr mapping  : address_mapping.json
+2026-02-06 12:00:00 [INFO] Distr. alpha  : 0.3 (Dirichlet, high variance)
 2026-02-06 12:00:00 [INFO] Fetching holders for collection: 6mS3jtvn...
-2026-02-06 12:00:01 [INFO] Got 23 unique holders
-2026-02-06 12:00:01 [INFO] Distribution plan (23 holders, total=10.0 USDC):
-2026-02-06 12:00:01 [INFO]   [  1/23] 7xKXtg...AsU -> 0.318472 USDC
-2026-02-06 12:00:01 [INFO]   [  2/23] 3yFwqX...y1E (mapped -> 9aBcDe...f2G) -> 0.142856 USDC
+2026-02-06 12:00:01 [INFO] Got 10 unique holders
+2026-02-06 12:00:01 [INFO] Distribution plan (10 holders, total=100.0 USDC):
+2026-02-06 12:00:01 [INFO]   [  1/10] 7xKXtg...AsU -> 3.182345 USDC
+2026-02-06 12:00:01 [INFO]   [  2/10] 3yFwqX...y1E -> 45.432100 USDC
 ...
 2026-02-06 12:00:01 [INFO] [DRY RUN] No transactions will be sent.
 ```
@@ -145,5 +164,4 @@ python nft_airdrop.py
 
 - **Never commit your private key to a Git repository.** Consider adding `config.ini` to your `.gitignore`.
 - The sender wallet must hold enough USDC for the airdrop plus a small amount of SOL to cover transaction fees and ATA rent.
-- The script will exit with an error if `min_usdc_amount × number of holders > total_usdc_amount`. Adjust your configuration accordingly.
 - When using address mapping, it is recommended to run `--test mapping <small_amount>` first to verify the mapped addresses can receive USDC.

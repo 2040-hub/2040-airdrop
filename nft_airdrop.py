@@ -60,6 +60,10 @@ def load_config(path: str = "config.ini") -> dict:
         "tx_sleep_time": float(s.get("tx_sleep_time", "1")),
         "tx_max_retries": int(s.get("tx_max_retries", "5")),
         "address_mapping_file": s.get("address_mapping_file", ""),
+        # 随机分配的 Dirichlet 分布 alpha 参数，控制金额分散程度：
+        # 1.0 = 原始切割线段算法（温和随机），<1 方差更大（少数人拿大额），>1 趋于均分
+        # 推荐值：0.1~0.5 产生更大方差，让部分持有者有机会拿到大额
+        "distribution_alpha": float(s.get("distribution_alpha", "1.0")),
     }
 
 
@@ -198,31 +202,94 @@ def apply_address_mapping(holders, address_mapping):
     return result
 
 
-def generate_random_amounts(total: float, n: int, min_amount: float) -> List[float]:
+def _random_split(pool, n, alpha=1.0):
+    # type: (float, int, float) -> List[float]
     """
-    Generate n random amounts that sum to total, each >= min_amount.
-    Uses the 'cut the line' algorithm (similar to WeChat random red envelopes).
+    Split 'pool' into n non-negative random parts that sum to pool.
+
+    When alpha == 1.0, uses the classic 'cut the line' algorithm (equivalent
+    to Dirichlet with alpha=1, i.e. uniform simplex sampling).
+
+    When alpha != 1.0, uses Dirichlet distribution via Gamma variates:
+      - alpha < 1: high variance (some get a lot, most get little)
+      - alpha > 1: low variance (amounts cluster around pool/n)
+
+    Returns a list of n floats summing to pool, each rounded to USDC_DECIMALS.
     """
     if n <= 0:
         return []
-    if min_amount * n > total:
+    if n == 1:
+        return [round(pool, USDC_DECIMALS)]
+    if pool <= 0:
+        return [0.0] * n
+
+    if alpha == 1.0:
+        # Classic cut-the-line: equivalent to Dirichlet(1,1,...,1)
+        cuts = sorted(random.uniform(0, pool) for _ in range(n - 1))
+        cuts = [0.0] + cuts + [pool]
+        parts = [round(cuts[i + 1] - cuts[i], USDC_DECIMALS) for i in range(n)]
+    else:
+        # Dirichlet distribution via Gamma variates
+        # alpha 必须 > 0；clamp 到一个安全下限避免数值问题
+        safe_alpha = max(alpha, 0.001)
+        gammas = []
+        for _ in range(n):
+            g = random.gammavariate(safe_alpha, 1.0)
+            gammas.append(g)
+        total_g = sum(gammas)
+        if total_g == 0:
+            # 极端情况兜底：均分
+            parts = [round(pool / n, USDC_DECIMALS)] * n
+        else:
+            parts = [round(pool * (g / total_g), USDC_DECIMALS) for g in gammas]
+
+    # 修正浮点漂移，保证精确求和
+    drift = round(pool - sum(parts), USDC_DECIMALS)
+    if drift != 0:
+        # 把漂移加到最大的那份上（影响最小）
+        max_idx = parts.index(max(parts))
+        parts[max_idx] = round(parts[max_idx] + drift, USDC_DECIMALS)
+
+    return parts
+
+
+def generate_random_amounts(
+    total,          # type: float
+    n,              # type: int
+    min_amount,     # type: float
+    alpha=1.0,      # type: float
+):
+    # type: (...) -> List[float]
+    """
+    Generate n random amounts that sum to total, each >= min_amount.
+    Uses the Dirichlet distribution to split the remaining pool after
+    guaranteeing each holder's minimum.
+
+    alpha controls the variance of the distribution:
+      - alpha = 1.0: classic 'cut the line' / uniform simplex (original behavior)
+      - alpha < 1.0: higher variance (some holders get much more, most get less)
+      - alpha > 1.0: lower variance (amounts cluster toward the mean)
+    """
+    if n <= 0:
+        return []
+
+    min_needed = round(min_amount * n, USDC_DECIMALS)
+    if min_needed > total:
         raise ValueError(
-            f"Cannot distribute {total} USDC to {n} holders with min {min_amount} each. "
-            f"Need at least {min_amount * n} USDC."
+            "Cannot distribute {total} USDC to {n} holders "
+            "({n} x {min_amount} = {min_needed} USDC needed).".format(
+                total=total, n=n, min_amount=min_amount, min_needed=min_needed,
+            )
         )
 
-    # Remaining pool after guaranteeing minimums
-    remaining = total - min_amount * n
+    remaining = total - min_needed
 
-    # Generate n-1 random cut points in [0, remaining]
-    cuts = sorted(random.uniform(0, remaining) for _ in range(n - 1))
-    cuts = [0.0] + cuts + [remaining]
+    # Split remaining pool using Dirichlet distribution
+    parts = _random_split(remaining, n, alpha=alpha)
 
     amounts = []
     for i in range(n):
-        amt = min_amount + (cuts[i + 1] - cuts[i])
-        # Round to 6 decimals (USDC precision)
-        amt = round(amt, USDC_DECIMALS)
+        amt = round(min_amount + parts[i], USDC_DECIMALS)
         amounts.append(amt)
 
     # Fix any floating point drift so total is exact
@@ -230,7 +297,6 @@ def generate_random_amounts(total: float, n: int, min_amount: float) -> List[flo
     if diff != 0:
         amounts[-1] = round(amounts[-1] + diff, USDC_DECIMALS)
 
-    # Shuffle so the last person isn't always the adjustment target
     random.shuffle(amounts)
     return amounts
 
@@ -493,6 +559,11 @@ def run_test_mapping(test_amount_str):
 def main():
     config = load_config()
 
+    # Validate distribution_alpha
+    if config["distribution_alpha"] <= 0:
+        logger.error("distribution_alpha must be > 0, got: %s", config["distribution_alpha"])
+        sys.exit(1)
+
     logger.info("=" * 60)
     logger.info("NFT Holder USDC Random Airdrop")
     logger.info("=" * 60)
@@ -503,6 +574,10 @@ def main():
     logger.info(f"Sleep time    : {config['tx_sleep_time']}s")
     logger.info(f"Max retries   : {config['tx_max_retries']}")
     logger.info(f"Addr mapping  : {config['address_mapping_file'] or '(none)'}")
+    if config["distribution_alpha"] != 1.0:
+        logger.info(f"Distr. alpha  : {config['distribution_alpha']} (Dirichlet, {'high' if config['distribution_alpha'] < 1 else 'low'} variance)")
+    else:
+        logger.info(f"Distr. alpha  : 1.0 (classic cut-the-line)")
 
     # 1. Fetch holders
     holders = fetch_holders(config["nft_worker_url"], config["nft_collection_id"])
@@ -525,6 +600,7 @@ def main():
             total=config["total_usdc_amount"],
             n=len(holders),
             min_amount=config["min_usdc_amount"],
+            alpha=config["distribution_alpha"],
         )
     except ValueError as e:
         logger.error(str(e))
